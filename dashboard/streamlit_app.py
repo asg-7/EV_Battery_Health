@@ -1,10 +1,15 @@
 import streamlit as st
+import sys
+import os
+
+# Add the parent directory (project root) to the system path to allow importing 'src'
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import requests
 import pandas as pd
 import time
 import plotly.express as px
 import plotly.graph_objects as go
-import os
 import sqlite3
 from datetime import datetime, timedelta
 
@@ -179,6 +184,55 @@ html, body, [data-testid="stAppViewContainer"] {
     border-bottom-color: #10B981 !important;
 }
 
+/* Sidebar Custom Card */
+.sidebar-card {
+    background: rgba(17, 24, 39, 0.6);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 12px;
+    padding: 16px;
+    margin-bottom: 20px;
+}
+.sidebar-card-title {
+    font-weight: 700;
+    color: #10B981;
+    font-size: 0.95rem;
+    margin-bottom: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    padding-bottom: 6px;
+}
+.sidebar-card-item {
+    font-size: 0.85rem;
+    color: #CBD5E1;
+    margin-bottom: 8px;
+    line-height: 1.4;
+}
+.sidebar-card-item b {
+    color: #94A3B8;
+}
+
+/* Sidebar Status badge */
+.sidebar-status-pill {
+    display: inline-block;
+    padding: 6px 12px;
+    border-radius: 9999px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    text-align: center;
+    width: 100%;
+}
+.pill-connected {
+    background-color: rgba(16, 185, 129, 0.15);
+    color: #10B981;
+    border: 1px solid rgba(16, 185, 129, 0.3);
+}
+.pill-disconnected {
+    background-color: rgba(239, 68, 68, 0.15);
+    color: #EF4444;
+    border: 1px solid rgba(239, 68, 68, 0.3);
+}
+
 /* Documentation styling */
 .docs-card {
     background: rgba(17, 24, 39, 0.6);
@@ -314,7 +368,9 @@ def reset_db_and_load_dataset(battery_id, custom_file=None):
         
         # 2. Pre-train models immediately on load so forecast / anomalies are populated right away
         with st.spinner("Pre-populating historical stream database & pre-training safety ML models..."):
-            pretrain_and_populate_models()
+            trained = pretrain_and_populate_models()
+            if not trained:
+                return False, "Database populated, but pre-training ML models failed. Please verify raw files."
             
         # 3. Reload session prediction cache
         load_rolling_predictions()
@@ -381,11 +437,11 @@ st.markdown('<div class="sub-header">Industrial monitoring dashboard featuring u
 
 # --- Sidebar Controls ---
 with st.sidebar:
-    st.markdown("### 🛠️ Telemetry Control Center")
-    st.markdown("Swap active datasets to check different battery degradation patterns.")
+    st.markdown("### 📁 Dataset Swapping")
+    st.markdown("Select an active battery profile to swap datasets and reload diagnostic models.")
     
     dataset_option = st.selectbox(
-        "Select Active Dataset",
+        "Select Battery Profile",
         ["NASA Battery B0005", "NASA Battery B0006", "NASA Battery B0007", "NASA Battery B0018", "Upload Custom CSV Dataset"]
     )
     
@@ -414,13 +470,18 @@ with st.sidebar:
             "B0018": {"temp": "24°C", "charge": "CC-CV charging, 1.5A to 4.2V", "discharge": "Constant current discharge at 2A to 2.5V", "cycles": "132 cycles (accelerated decay)"}
         }
         
-        st.markdown(f"**Battery Profile: {bid}**")
-        st.markdown(f"- **Ambient Temp:** {details[bid]['temp']}")
-        st.markdown(f"- **Charge Scheme:** {details[bid]['charge']}")
-        st.markdown(f"- **Discharge Cutoff:** {details[bid]['discharge']}")
-        st.markdown(f"- **Total Lifecycle:** {details[bid]['cycles']}")
+        # Render a beautiful HTML card for the profile details!
+        st.markdown(f"""
+        <div class="sidebar-card">
+            <div class="sidebar-card-title">🔋 Cell Profile {bid}</div>
+            <div class="sidebar-card-item">🌡️ <b>Ambient Temp:</b> {details[bid]['temp']}</div>
+            <div class="sidebar-card-item">⚡ <b>Charge Scheme:</b> {details[bid]['charge']}</div>
+            <div class="sidebar-card-item">🛑 <b>Cutoff Voltage:</b> {details[bid]['discharge']}</div>
+            <div class="sidebar-card-item">🔄 <b>Total Lifecycle:</b> {details[bid]['cycles']}</div>
+        </div>
+        """, unsafe_allow_html=True)
         
-        if st.button(f"🚀 Initialize NASA {bid} Profile", use_container_width=True):
+        if st.button(f"🚀 Initialize {bid} Profile", use_container_width=True):
             success, msg = reset_db_and_load_dataset(bid)
             if success:
                 st.success(msg)
@@ -443,11 +504,11 @@ with st.sidebar:
     try:
         res = requests.get(f"{API_URL}/metrics/latest")
         if res.status_code == 200:
-            st.success("● FastAPI Service: CONNECTED")
+            st.markdown('<div class="sidebar-status-pill pill-connected">● Connected</div>', unsafe_allow_html=True)
         else:
-            st.warning("● FastAPI Service: UNHEALTHY")
+            st.markdown('<div class="sidebar-status-pill pill-disconnected">● Unhealthy</div>', unsafe_allow_html=True)
     except Exception:
-        st.error("● FastAPI Service: DISCONNECTED")
+        st.markdown('<div class="sidebar-status-pill pill-disconnected">● Disconnected</div>', unsafe_allow_html=True)
 
 # --- Main Dashboard Tabs ---
 tab1, tab2, tab3 = st.tabs(["📊 Real-Time Monitor", "💡 LSTM Predictions & Thermal Analytics", "🧮 How Calculations Work"])
@@ -469,7 +530,6 @@ with tab1:
         # If DB is populated but latest is empty, extract latest values directly from DB history
         if not latest and not df_history.empty:
             last_row = df_history.iloc[-1]
-            # Estimate anomalies in the last hour
             recent_anoms = int(df_history['is_anomaly'].iloc[-30:].sum())
             health_score = max(0, 100 - (recent_anoms * 5))
             latest = {
@@ -520,7 +580,6 @@ with tab1:
             
             c_col1, c_col2 = st.columns(2)
             with c_col1:
-                # Voltage Line Plot
                 fig_v = go.Figure()
                 fig_v.add_trace(go.Scatter(x=df_history['timestamp'], y=df_history['voltage'], name='Voltage', line=dict(color='#3B82F6', width=2.5)))
                 if not anom_subset.empty:
@@ -539,7 +598,6 @@ with tab1:
                 st.plotly_chart(fig_v, use_container_width=True)
                 
             with c_col2:
-                # Temperature Line Plot
                 fig_t = go.Figure()
                 fig_t.add_trace(go.Scatter(x=df_history['timestamp'], y=df_history['temp'], name='Temperature', line=dict(color='#F59E0B', width=2.5)))
                 if not anom_subset.empty:
@@ -559,7 +617,6 @@ with tab1:
                 
             c_col3, c_col4 = st.columns(2)
             with c_col3:
-                # Current Line Plot
                 fig_c = go.Figure()
                 fig_c.add_trace(go.Scatter(x=df_history['timestamp'], y=df_history['current'], name='Current', line=dict(color='#8B5CF6', width=2.5)))
                 if not anom_subset.empty:
@@ -578,7 +635,6 @@ with tab1:
                 st.plotly_chart(fig_c, use_container_width=True)
                 
             with c_col4:
-                # Capacity Decay Plot
                 fig_cap = go.Figure()
                 fig_cap.add_trace(go.Scatter(x=df_history['timestamp'], y=df_history['capacity'], name='Capacity', line=dict(color='#EC4899', width=2.5)))
                 fig_cap.update_layout(
@@ -595,13 +651,11 @@ with tab1:
 
 with tab2:
     st.markdown("### 🌡️ Thermal Analytics & LSTM Forecasting")
-    st.markdown("LSTM Recurrent Neural Network fits on past temperature trends to predict future temperature spikes, assisting in proactive thermal runaway protection.")
+    st.markdown("LSTM Recurrent Neural Network fits on past temperature trends to predict future temperature spikes, assisting in proactive thermal runway protection.")
     
-    # Check if prediction history is in session state; if not, initialize and load
     if 'pred_history' not in st.session_state or not st.session_state.pred_history:
         load_rolling_predictions()
         
-    # Append latest live updates if in live mode
     if live_mode and latest:
         current_ts = latest.get('timestamp')
         if current_ts and (not st.session_state.pred_history or st.session_state.pred_history[-1]['timestamp'] != current_ts):
@@ -626,12 +680,10 @@ with tab2:
     if st.session_state.pred_history:
         df_pred = pd.DataFrame(st.session_state.pred_history)
         
-        # Plotly Actual vs Predicted
         fig_pred = go.Figure()
         fig_pred.add_trace(go.Scatter(x=df_pred['timestamp'], y=df_pred['Actual'], name='Actual Cell Temp', line=dict(color='#F59E0B', width=2.5)))
         fig_pred.add_trace(go.Scatter(x=df_pred['timestamp'], y=df_pred['Predicted'], name='LSTM Forecast (Next Step)', line=dict(color='#10B981', width=2, dash='dash')))
         
-        # Calculate error margin
         mae = (df_pred['Actual'] - df_pred['Predicted']).abs().mean()
         
         p_col1, p_col2 = st.columns([3, 1])
