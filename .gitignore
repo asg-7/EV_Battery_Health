@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 .env
 data/Battery.csv
+data/battery_stream.db
+data/cleaned_dataset/
+models/*.pkl
+models/*.h5

@@ -41,7 +41,7 @@ def detect_anomalies_window(window_minutes=2):
         return []
     with open(MODEL_PATH, 'rb') as f:
         model = pickle.load(f)
-    features = df[['voltage', 'current', 'temp', 'capacity']].fillna(method='ffill')
+    features = df[['voltage', 'current', 'temp', 'capacity']].ffill()
     preds = model.predict(features)
     anomalies = df[preds == -1]
     # Insert anomalies into table
@@ -55,9 +55,19 @@ def detect_anomalies_window(window_minutes=2):
 
 if __name__ == "__main__":
     create_anomalies_table()
-    train_initial_model()
+    print("Anomaly detector service started...")
     while True:
+        if not os.path.exists(MODEL_PATH):
+            model = train_initial_model()
+            if model is not None:
+                print("Successfully trained Isolation Forest model!")
+            else:
+                # Silently wait or print status
+                pass
+        
+        # Detect anomalies in the last window
         anomalies = detect_anomalies_window()
         if anomalies:
-            print(f"⚠️ Detected {len(anomalies)} anomalies")
-        time.sleep(10)
+            print(f"Detected {len(anomalies)} anomalies")
+        time.sleep(5) # Check every 5 seconds for more responsive real-time dashboard updates
+
