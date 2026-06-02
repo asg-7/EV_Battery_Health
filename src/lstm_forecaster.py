@@ -17,9 +17,12 @@ def prepare_sequences(data, seq_length=10):
     return np.array(X), np.array(y)
 
 def train_lstm():
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query("SELECT temp FROM battery_telemetry ORDER BY timestamp", conn)
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        df = pd.read_sql_query("SELECT temp FROM battery_telemetry ORDER BY timestamp", conn)
+        conn.close()
+    except (sqlite3.OperationalError, pd.errors.DatabaseError):
+        return None
     if len(df) < 50:
         return None
     values = df['temp'].values.reshape(-1, 1)
@@ -40,9 +43,12 @@ def predict_next_temperature():
     if not os.path.exists(MODEL_PATH):
         return None
     model = tf.keras.models.load_model(MODEL_PATH)
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query("SELECT temp FROM battery_telemetry ORDER BY timestamp DESC LIMIT 10", conn)
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        df = pd.read_sql_query("SELECT temp FROM battery_telemetry ORDER BY timestamp DESC LIMIT 10", conn)
+        conn.close()
+    except (sqlite3.OperationalError, pd.errors.DatabaseError):
+        return None
     if len(df) < 10:
         return None
     last_10 = df['temp'].values[::-1].reshape(1, 10, 1)

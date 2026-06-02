@@ -9,9 +9,12 @@ DB_PATH = "data/battery_stream.db"
 MODEL_PATH = "models/isolation_forest.pkl"
 
 def train_initial_model():
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query("SELECT voltage, current, temp, capacity FROM battery_telemetry", conn)
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        df = pd.read_sql_query("SELECT voltage, current, temp, capacity FROM battery_telemetry", conn)
+        conn.close()
+    except (sqlite3.OperationalError, pd.errors.DatabaseError):
+        return None
     if df.shape[0] < 100:
         return None
     model = IsolationForest(contamination=0.05, random_state=42)
@@ -29,14 +32,17 @@ def create_anomalies_table():
     conn.close()
 
 def detect_anomalies_window(window_minutes=2):
-    conn = sqlite3.connect(DB_PATH)
-    # Use julianday for time difference (works on SQLite)
-    df = pd.read_sql_query(f"""
-        SELECT timestamp, cycle_id, voltage, current, temp, capacity 
-        FROM battery_telemetry 
-        WHERE julianday('now') - julianday(timestamp) <= {window_minutes}/1440.0
-    """, conn)
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        # Use julianday for time difference (works on SQLite)
+        df = pd.read_sql_query(f"""
+            SELECT timestamp, cycle_id, voltage, current, temp, capacity 
+            FROM battery_telemetry 
+            WHERE julianday('now') - julianday(timestamp) <= {window_minutes}/1440.0
+        """, conn)
+        conn.close()
+    except (sqlite3.OperationalError, pd.errors.DatabaseError):
+        return []
     if df.empty or not os.path.exists(MODEL_PATH):
         return []
     with open(MODEL_PATH, 'rb') as f:

@@ -6,7 +6,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 
 API_URL = "http://localhost:8000"
 
@@ -215,6 +215,43 @@ def render_metric_card(title, value, unit, icon, glow_class):
     """
     st.markdown(card_html, unsafe_allow_html=True)
 
+def pretrain_and_populate_models():
+    """Trains Isolation Forest and LSTM forecaster immediately using the loaded data."""
+    try:
+        # 1. Train Isolation Forest
+        from src.anomaly_detector import train_initial_model, MODEL_PATH, DB_PATH
+        model = train_initial_model()
+        
+        # 2. Pre-detect anomalies across the entire dataset
+        if model is not None and os.path.exists(MODEL_PATH):
+            conn = sqlite3.connect(DB_PATH)
+            df = pd.read_sql_query("SELECT timestamp, cycle_id, voltage, current, temp, capacity FROM battery_telemetry", conn)
+            if not df.empty:
+                features = df[['voltage', 'current', 'temp', 'capacity']].ffill()
+                preds = model.predict(features)
+                anomalies = df[preds == -1]
+                
+                # Clear and insert all detected anomalies
+                conn.execute("DELETE FROM anomalies")
+                for _, row in anomalies.iterrows():
+                    conn.execute("INSERT INTO anomalies (timestamp, cycle_id) VALUES (?,?)",
+                                 (row['timestamp'], int(row['cycle_id'])))
+                conn.commit()
+            conn.close()
+            
+        # 3. Train LSTM temperature forecaster
+        from src.lstm_forecaster import train_lstm
+        train_lstm()
+        
+        # 4. Initialize prediction history using all available points
+        if 'pred_history' in st.session_state:
+            st.session_state.pred_history = []
+            
+        return True
+    except Exception as e:
+        st.error(f"Failed to pre-train models: {e}")
+        return False
+
 def reset_db_and_load_dataset(battery_id, custom_file=None):
     import shutil
     try:
@@ -235,25 +272,54 @@ def reset_db_and_load_dataset(battery_id, custom_file=None):
         
         # Reset database tables
         db_path = "data/battery_stream.db"
-        if os.path.exists(db_path):
-            conn = sqlite3.connect(db_path)
-            cursor = conn.cursor()
-            cursor.execute("DROP TABLE IF EXISTS battery_telemetry")
-            cursor.execute("DROP TABLE IF EXISTS anomalies")
-            conn.commit()
-            conn.close()
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("DROP TABLE IF EXISTS battery_telemetry")
+        cursor.execute("DROP TABLE IF EXISTS anomalies")
+        
+        # Recreate tables immediately
+        cursor.execute('''CREATE TABLE battery_telemetry (
+                        timestamp TEXT,
+                        cycle_id INTEGER,
+                        voltage REAL,
+                        current REAL,
+                        temp REAL,
+                        capacity REAL
+                    )''')
+        cursor.execute('''CREATE TABLE anomalies (
+                        timestamp TEXT,
+                        cycle_id INTEGER
+                    )''')
+        conn.commit()
+        
+        # 1. Pre-populate database with all telemetry rows from Battery.csv
+        df = pd.read_csv(dest_csv)
+        df = df.rename(columns={
+            'Voltage_measured': 'voltage',
+            'Current_measured': 'current',
+            'Temperature_measured': 'temp',
+            'Capacity': 'capacity',
+            'cycle': 'cycle_id'
+        })
+        
+        # Insert records sequentially with increments to construct a clean history timeline
+        start_time = datetime.now() - timedelta(minutes=len(df) * 2)
+        for idx, row in df.iterrows():
+            ts = (start_time + timedelta(minutes=idx * 2)).isoformat()
+            cursor.execute("INSERT INTO battery_telemetry VALUES (?,?,?,?,?,?)",
+                         (ts, int(row['cycle_id']), float(row['voltage']),
+                          float(row['current']), float(row['temp']), float(row['capacity'])))
+        conn.commit()
+        conn.close()
+        
+        # 2. Pre-train models immediately on load so forecast / anomalies are populated right away
+        with st.spinner("Pre-populating historical stream database & pre-training safety ML models..."):
+            pretrain_and_populate_models()
             
-        # Delete old trained model files to force retraining on new telemetry profile
-        model_paths = ["models/isolation_forest.pkl", "models/lstm_temp.h5"]
-        for p in model_paths:
-            if os.path.exists(p):
-                os.remove(p)
-                
-        # Clear rolling state
-        if 'pred_history' in st.session_state:
-            st.session_state.pred_history = []
+        # 3. Reload session prediction cache
+        load_rolling_predictions()
             
-        return True, f"Successfully loaded **{dataset_name}**! Telemetry DB and models have been reset. **Please restart your stream simulator script.**"
+        return True, f"Successfully loaded **{dataset_name}**! Telemetry database populated and ML models pre-trained successfully."
     except Exception as e:
         return False, f"Error: {str(e)}"
 
@@ -263,21 +329,51 @@ def get_telemetry_history():
         return pd.DataFrame()
     try:
         conn = sqlite3.connect(db_path)
-        # Perform LEFT JOIN to get anomaly status directly linked to telemetry cycles
         df = pd.read_sql_query("""
             SELECT t.timestamp, t.cycle_id, t.voltage, t.current, t.temp, t.capacity,
                    CASE WHEN a.timestamp IS NOT NULL THEN 1 ELSE 0 END as is_anomaly
             FROM battery_telemetry t
             LEFT JOIN anomalies a ON t.timestamp = a.timestamp
             ORDER BY t.timestamp DESC
-            LIMIT 100
+            LIMIT 150
         """, conn)
         conn.close()
-        # Reverse to display chronologically in the graphs
         return df.iloc[::-1].reset_index(drop=True)
     except Exception as e:
         print(f"Error querying telemetry: {e}")
         return pd.DataFrame()
+
+def load_rolling_predictions():
+    """Generates the actual vs predicted history using the newly trained LSTM model."""
+    st.session_state.pred_history = []
+    db_path = "data/battery_stream.db"
+    if not os.path.exists(db_path) or not os.path.exists("models/lstm_temp.h5"):
+        return
+        
+    try:
+        # Load model and prepare sequences using TensorFlow
+        import tensorflow as tf
+        model = tf.keras.models.load_model("models/lstm_temp.h5")
+        
+        conn = sqlite3.connect(db_path)
+        df = pd.read_sql_query("SELECT timestamp, temp FROM battery_telemetry ORDER BY timestamp", conn)
+        conn.close()
+        
+        if len(df) < 15:
+            return
+            
+        temps = df['temp'].values
+        # Create rolling predictions for the last 50 points
+        for i in range(max(10, len(df) - 50), len(df) - 1):
+            seq = temps[i-10:i].reshape(1, 10, 1)
+            pred = float(model.predict(seq, verbose=0)[0][0])
+            st.session_state.pred_history.append({
+                'timestamp': df.iloc[i+1]['timestamp'],
+                'Actual': temps[i+1],
+                'Predicted': pred
+            })
+    except Exception as e:
+        print(f"Error generating rolling prediction history: {e}")
 
 # --- Main Layout ---
 st.markdown('<div class="main-header">⚡ EV BATTERY DIAGNOSTICS & TELEMETRY</div>', unsafe_allow_html=True)
@@ -299,7 +395,7 @@ with st.sidebar:
         st.markdown("**Upload Custom Battery Dataset**")
         st.markdown("CSV must contain columns: `Voltage_measured`, `Current_measured`, `Temperature_measured`, `Capacity`, `cycle`.")
         
-        # Center uploader container inside sidebar
+        # Centered file uploader
         custom_file = st.file_uploader("", type=["csv"])
         if custom_file is not None:
             if st.button("🚀 Load Custom Dataset", use_container_width=True):
@@ -309,10 +405,8 @@ with st.sidebar:
                 else:
                     st.error(msg)
     else:
-        # Get battery ID
         bid = dataset_option.split()[-1]
         
-        # Display specific details about selected NASA battery
         details = {
             "B0005": {"temp": "24°C", "charge": "CC-CV charging, 1.5A to 4.2V", "discharge": "Constant current discharge at 2A to 2.7V", "cycles": "168 cycles"},
             "B0006": {"temp": "24°C", "charge": "CC-CV charging, 1.5A to 4.2V", "discharge": "Constant current discharge at 2A to 2.5V", "cycles": "168 cycles"},
@@ -326,7 +420,7 @@ with st.sidebar:
         st.markdown(f"- **Discharge Cutoff:** {details[bid]['discharge']}")
         st.markdown(f"- **Total Lifecycle:** {details[bid]['cycles']}")
         
-        if st.button(f"🚀 Load NASA {bid} & Reset Stream", use_container_width=True):
+        if st.button(f"🚀 Initialize NASA {bid} Profile", use_container_width=True):
             success, msg = reset_db_and_load_dataset(bid)
             if success:
                 st.success(msg)
@@ -334,8 +428,18 @@ with st.sidebar:
                 st.error(msg)
 
     st.divider()
-    st.markdown("### 🖥️ System Status")
-    # Show active services indicators
+    
+    # --- Live Mode Toggles (OFF by default) ---
+    st.markdown("### 🖥️ Dashboard Live Mode")
+    live_mode = st.toggle("Enable Live Telemetry Stream", value=False)
+    
+    # Manual Refresh button for when Live Mode is disabled
+    if not live_mode:
+        if st.button("🔄 Refresh Dashboard Data", use_container_width=True):
+            st.rerun()
+
+    st.divider()
+    st.markdown("### 📡 API Connection")
     try:
         res = requests.get(f"{API_URL}/metrics/latest")
         if res.status_code == 200:
@@ -348,7 +452,7 @@ with st.sidebar:
 # --- Main Dashboard Tabs ---
 tab1, tab2, tab3 = st.tabs(["📊 Real-Time Monitor", "💡 LSTM Predictions & Thermal Analytics", "🧮 How Calculations Work"])
 
-# Fetch latest metrics
+# Fetch latest metrics from backend
 latest = {}
 try:
     latest = requests.get(f"{API_URL}/metrics/latest").json()
@@ -358,11 +462,25 @@ except Exception:
 df_history = get_telemetry_history()
 
 with tab1:
-    if not latest:
+    if not latest and df_history.empty:
         st.warning("⏳ Waiting for API connection... Please ensure uvicorn and your stream simulator are running.")
         st.info("💡 To start the telemetry stream, launch: `python -m src.stream_simulator` and `uvicorn src.api:app`.")
     else:
-        # --- Live Metrics Bar ---
+        # If DB is populated but latest is empty, extract latest values directly from DB history
+        if not latest and not df_history.empty:
+            last_row = df_history.iloc[-1]
+            # Estimate anomalies in the last hour
+            recent_anoms = int(df_history['is_anomaly'].iloc[-30:].sum())
+            health_score = max(0, 100 - (recent_anoms * 5))
+            latest = {
+                'health_score': health_score,
+                'voltage': last_row['voltage'],
+                'current': last_row['current'],
+                'temp': last_row['temp'],
+                'capacity': last_row['capacity'],
+                'anomaly_count_last_hour': recent_anoms
+            }
+            
         health_score = latest.get('health_score', 100)
         voltage = latest.get('voltage', 0.0)
         current = latest.get('current', 0.0)
@@ -374,6 +492,7 @@ with tab1:
         temp_glow = "glow-orange" if temp < 45 else "glow-red"
         anom_glow = "glow-green" if recent_anoms == 0 else "glow-red"
         
+        # --- Live Metrics Bar ---
         m_col1, m_col2, m_col3, m_col4, m_col5, m_col6 = st.columns(6)
         with m_col1:
             render_metric_card("❤️ Health Score", f"{health_score}", "%", "❤️", health_glow)
@@ -392,10 +511,10 @@ with tab1:
         
         # --- Charts Section ---
         if df_history.empty:
-            st.info("Telemetry database is empty. Once you run `stream_simulator.py`, the live sensor stream charts will appear here.")
+            st.info("Telemetry database is empty. Once you load a dataset or start the simulator, charts will appear.")
         else:
-            st.markdown("### 📉 Live Telemetry Stream Profile")
-            st.markdown("Highlighted points in <span style='color:#EF4444; font-weight:700;'>RED</span> denote anomalies detected in real-time by the unsupervised Isolation Forest model.", unsafe_allow_html=True)
+            st.markdown("### 📉 Telemetry Stream Profile")
+            st.markdown("Highlighted points in <span style='color:#EF4444; font-weight:700;'>RED</span> denote anomalies detected by the unsupervised Isolation Forest model.", unsafe_allow_html=True)
             
             anom_subset = df_history[df_history['is_anomaly'] == 1]
             
@@ -476,47 +595,33 @@ with tab1:
 
 with tab2:
     st.markdown("### 🌡️ Thermal Analytics & LSTM Forecasting")
-    st.markdown("LSTM Recurrent Neural Network fits on past temperature trends to predict future temperature spikes, assisting in proactive thermal runway protection.")
+    st.markdown("LSTM Recurrent Neural Network fits on past temperature trends to predict future temperature spikes, assisting in proactive thermal runaway protection.")
     
-    # Store predictions in state
-    if 'pred_history' not in st.session_state:
-        st.session_state.pred_history = []
+    # Check if prediction history is in session state; if not, initialize and load
+    if 'pred_history' not in st.session_state or not st.session_state.pred_history:
+        load_rolling_predictions()
         
-    if latest:
+    # Append latest live updates if in live mode
+    if live_mode and latest:
         current_ts = latest.get('timestamp')
         if current_ts and (not st.session_state.pred_history or st.session_state.pred_history[-1]['timestamp'] != current_ts):
             actual_t = latest.get('temp')
             pred_t = None
-            pred_status = "OK"
-            msg = ""
-            
             try:
                 pred_res = requests.get(f"{API_URL}/predict/temp").json()
                 if "predicted_next_temp_celsius" in pred_res:
                     pred_t = pred_res["predicted_next_temp_celsius"]
-                elif "error" in pred_res:
-                    pred_status = pred_res["error"]
-                    msg = pred_res.get("message", "")
-            except Exception as e:
-                pred_status = "Disconnected"
+            except Exception:
+                pass
                 
-            if actual_t is not None:
-                if pred_t is not None:
-                    st.session_state.pred_history.append({
-                        'timestamp': current_ts,
-                        'Actual': actual_t,
-                        'Predicted': pred_t
-                    })
-                    if len(st.session_state.pred_history) > 60:
-                        st.session_state.pred_history.pop(0)
-                else:
-                    # Output status messages on dashboard
-                    if pred_status == "Training":
-                        st.warning(f"⚙️ {msg}")
-                    elif pred_status == "NotEnoughData":
-                        st.info(f"📊 {msg}")
-                    elif pred_status == "NoModel":
-                        st.info("ℹ️ Telemetry database has sufficient points, but the LSTM sequential forecaster model is not ready. Querying...")
+            if actual_t is not None and pred_t is not None:
+                st.session_state.pred_history.append({
+                    'timestamp': current_ts,
+                    'Actual': actual_t,
+                    'Predicted': pred_t
+                })
+                if len(st.session_state.pred_history) > 60:
+                    st.session_state.pred_history.pop(0)
     
     if st.session_state.pred_history:
         df_pred = pd.DataFrame(st.session_state.pred_history)
@@ -553,7 +658,7 @@ with tab2:
             - Divergences can indicate unusual external heating, cooling malfunctions, or high internal cell resistance.
             """)
     else:
-        st.info("Waiting for LSTM model predictions... Once the simulator runs and generates enough records (at least 50 points in the database), the forecast chart will activate automatically.")
+        st.info("Waiting for LSTM model predictions... Ensure that the database contains at least 50 points so the pre-training loop executes.")
 
 with tab3:
     st.markdown("### 🧮 What is this system calculating?")
@@ -606,7 +711,6 @@ with tab3:
         * **Memory Cell Structure:** LSTMs are equipped with gating units that decide what historical information to keep or forget. This prevents gradient vanishing during sequence training.
         """)
         
-        # Drawing a clean text-based diagram of LSTM gates
         st.markdown("""
         ```
          [Input sequence X(t-10)...X(t)] 
@@ -644,6 +748,7 @@ with tab3:
         """)
         st.markdown('</div>', unsafe_allow_html=True)
 
-# Periodically rerun the page to pull live telemetry streams
-time.sleep(2)
-st.rerun()
+# Run st.rerun() periodically only if Live Mode is toggled ON
+if live_mode:
+    time.sleep(2)
+    st.rerun()

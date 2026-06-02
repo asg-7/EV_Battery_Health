@@ -9,18 +9,24 @@ app = FastAPI(title="EV Battery Telemetry API")
 DB_PATH = "data/battery_stream.db"
 
 def get_latest_metrics():
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query("SELECT * FROM battery_telemetry ORDER BY timestamp DESC LIMIT 1", conn)
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        df = pd.read_sql_query("SELECT * FROM battery_telemetry ORDER BY timestamp DESC LIMIT 1", conn)
+        conn.close()
+    except (sqlite3.OperationalError, pd.errors.DatabaseError):
+        return {}
     if df.empty:
         return {}
     return df.iloc[0].to_dict()
 
 def get_anomaly_count_last_hour():
-    conn = sqlite3.connect(DB_PATH)
-    # 1 hour = 1/24 of a day in julianday
-    count = conn.execute("SELECT COUNT(*) FROM anomalies WHERE julianday('now') - julianday(timestamp) <= 1.0/24").fetchone()[0]
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        # 1 hour = 1/24 of a day in julianday
+        count = conn.execute("SELECT COUNT(*) FROM anomalies WHERE julianday('now') - julianday(timestamp) <= 1.0/24").fetchone()[0]
+        conn.close()
+    except (sqlite3.OperationalError, sqlite3.DatabaseError, pd.errors.DatabaseError):
+        count = 0
     return count
 
 @app.get("/metrics/latest")
@@ -32,9 +38,12 @@ def latest():
 
 @app.get("/anomalies")
 def anomalies(hours: int = 24):
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query(f"SELECT timestamp, cycle_id FROM anomalies WHERE julianday('now') - julianday(timestamp) <= {hours}/24.0", conn)
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        df = pd.read_sql_query(f"SELECT timestamp, cycle_id FROM anomalies WHERE julianday('now') - julianday(timestamp) <= {hours}/24.0", conn)
+        conn.close()
+    except (sqlite3.OperationalError, pd.errors.DatabaseError):
+        return []
     return df.to_dict('records')
 
 @app.get("/predict/temp")
